@@ -107,15 +107,23 @@ class PdfBenchmarkController extends Controller
             $B = $this->bench($php, $yii, 'setapdf_rewrite_gc', $pdf, $base, $repeats);
             $C = $O['ok'] ? $this->bench($php, $yii, 'qpdf_overlay',    $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
             $D = $O['ok'] ? $this->bench($php, $yii, 'setapdf_rewrite', $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
+            // E: PDFlib+PDI (nur falls die Erweiterung geladen ist; sonst sauber n/a)
+            $E = $O['ok'] ? $this->bench($php, $yii, 'pdflib_overlay',  $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
 
             foreach ([$A, $B, $C, $D] as $r) { if (empty($r['ok']) && !$firstErr && !empty($r['note'])) $firstErr = $r['note']; }
 
-            $structOK = ($a['tagged'] && !empty($C['ok']) && $C['out'])
-                ? ($this->rootHasStructTree($C['out']) ? 'ja' : 'NEIN')
-                : ($a['tagged'] ? '?' : '–');
-            $ua = ($verapdf && !empty($C['ok'])) ? $this->veraUA($verapdf, $C['out']) : null;
+            // Tag-Erhalt + PDF/UA fuer beide Kandidaten (C = qpdf, E = PDFlib)
+            $structCheck = function (array $r) use ($a): string {
+                if (!$a['tagged']) return '–';
+                if (empty($r['ok']) || empty($r['out'])) return '?';
+                return $this->rootHasStructTree($r['out']) ? 'ja' : 'NEIN';
+            };
+            $structOK  = $structCheck($C);
+            $structOKE = $structCheck($E);
+            $ua  = ($verapdf && !empty($C['ok'])) ? $this->veraUA($verapdf, $C['out']) : null;
+            $uaE = ($verapdf && !empty($E['ok'])) ? $this->veraUA($verapdf, $E['out']) : null;
 
-            $rows[] = compact('name', 'a', 'O', 'A', 'B', 'C', 'D', 'structOK', 'ua');
+            $rows[] = compact('name', 'a', 'O', 'A', 'B', 'C', 'D', 'E', 'structOK', 'structOKE', 'ua', 'uaE');
         }
 
         $this->printReport($rows, $firstErr, $bootstrapOk = true, $verapdf);
@@ -143,6 +151,9 @@ class PdfBenchmarkController extends Controller
                 case 'qpdf_overlay':
                     $res = $this->measure(fn() => $this->qpdfOverlay($in, $out, $text), $out);
                     break;
+                case 'pdflib_overlay':
+                    $res = $this->measure(fn() => $this->pdflibOverlay($in, $out, $text), $out);
+                    break;
                 default:
                     throw new \RuntimeException("unbekannte Operation: $op");
             }
@@ -159,9 +170,11 @@ class PdfBenchmarkController extends Controller
         $t0 = hrtime(true);
         $op();
         $ms = (hrtime(true) - $t0) / 1e6;
+        $ok = is_file($out) && filesize($out) > 0;
         return [
-            'ok'      => is_file($out) && filesize($out) > 0,
+            'ok'      => $ok,
             'ms'      => round($ms, 1),
+            'size'    => $ok ? filesize($out) : 0,
             'peak_mb' => round(memory_get_peak_usage(true) / 1048576, 1),
             'note'    => '',
         ];
@@ -176,12 +189,15 @@ class PdfBenchmarkController extends Controller
     {
         $raw = file_get_contents($in);
 
-        // Bei --security=1 braucht PdfBehavior evtl. ein Pdfsec-Modell ('rights').
-        // Standard (security aus) kommt ohne DB aus.
+        // Bei --security=1 das echte Pdfsec laden – exakt wie in sendPdf().
         $pdfsec = null;
         if ($this->security) {
-            // TODO: bei aktivierter Security euer echtes Pdfsec laden, z.B.:
-            // $pdfsec = \common\models\Pdfsec::find()->where(['pid' => Yii::$app->params['pid']])->one();
+            $pdfsec = \common\models\Pdfsec::find()
+                ->where(['=', 'pid', Yii::$app->params['pid']])
+                ->one();
+            if ($pdfsec === null) {
+                throw new \RuntimeException('Pdfsec fuer pid "' . (Yii::$app->params['pid'] ?? '?') . '" nicht gefunden (DB erreichbar? params korrekt?)');
+            }
         }
 
         $this->attachBehavior('pdf', [
@@ -208,16 +224,70 @@ class PdfBenchmarkController extends Controller
         }
     }
 
-    /* ---- qpdf-Overlay: Artifact-Stamp erzeugen + ueberlagern --------- */
+    /* ---- qpdf-Overlay: Artifact-Stamp erzeugen + ueberlagern ---------
+     * Bei --security=1 wird zusaetzlich AES-256-verschluesselt (Rechte wie
+     * in eurer Produktion: Drucken erlaubt, Kopieren/Aendern verboten), damit
+     * der Vergleich mit SetaPDF+setSecurity fair bleibt. Verifiziert: Overlay
+     * und Encrypt laufen in EINEM qpdf-Aufruf, Tag-Tree bleibt erhalten.
+     * ---------------------------------------------------------------- */
     private function qpdfOverlay(string $in, string $out, string $text): void
     {
         [$w, $h] = $this->firstPageSize($in);
         $stamp = "$out.stamp.pdf";
         $this->generateArtifactStamp($stamp, $w, $h, $text);
-        exec('qpdf ' . escapeshellarg($in) . ' --overlay ' . escapeshellarg($stamp)
+        $enc = $this->security
+            ? ' --encrypt --owner-password=' . escapeshellarg(bin2hex(random_bytes(16)))
+            . ' --bits=256 --print=full --modify=none --extract=n -- '
+            : ' ';
+        exec('qpdf ' . escapeshellarg($in) . $enc . '--overlay ' . escapeshellarg($stamp)
             . ' --repeat=1 -- ' . escapeshellarg($out) . ' 2>&1', $o, $rc);
         @unlink($stamp);
         if ($rc !== 0 && $rc !== 3) throw new \RuntimeException("qpdf overlay rc=$rc: " . implode(' | ', $o));
+    }
+
+    /* ---- PDFlib+PDI-Overlay (Variante E) -----------------------------
+     * Laeuft nur, wenn die PDFlib-PHP-Erweiterung geladen ist; sonst n/a
+     * mit klarer Meldung. ACHTUNG, ungetestete Referenz-Implementierung:
+     * Ich konnte PDFlib nicht ausfuehren (kommerzielle Lizenz). Die API-Aufrufe
+     * folgen der PDFlib-9/10-Doku (PDI-Seitenimport + Tagged-Modus + Artifact-
+     * Item), koennen aber je nach eurer PDFlib-Version abweichen – Fehler
+     * erscheinen als note im Report. Tag-Erhalt wird wie bei qpdf separat
+     * geprueft (Spalte 'Tags erhalten' / veraPDF), NICHT angenommen.
+     * ---------------------------------------------------------------- */
+    private function pdflibOverlay(string $in, string $out, string $text): void
+    {
+        if (!class_exists('\PDFlib')) {
+            throw new \RuntimeException('PDFlib-Erweiterung nicht geladen – Variante uebersprungen');
+        }
+        $p = new \PDFlib();
+        $p->set_option('errorpolicy=exception stringformat=utf8');
+        // Falls Lizenzschluessel noetig: $p->set_option('license=...');
+
+        // Quelle MIT Tag-Strukturen oeffnen, Ziel im Tagged-Modus erzeugen
+        $doc = $p->open_pdi_document($in, 'usetags=true');
+        if ($p->begin_document($out, 'tagged=true lang=de') === 0) {
+            throw new \RuntimeException('PDFlib begin_document: ' . $p->get_errmsg());
+        }
+        $gs   = $p->create_gstate('opacityfill=0.3 opacitystroke=0.3');
+        $font = $p->load_font('Helvetica', 'unicode', 'embedding');
+        $n    = (int)$p->pcos_get_number($doc, 'length:pages');
+
+        for ($i = 0; $i < $n; $i++) {
+            $w = $p->pcos_get_number($doc, "pages[$i]/width");
+            $h = $p->pcos_get_number($doc, "pages[$i]/height");
+            $page = $p->open_pdi_page($doc, $i + 1, 'usetags=true');
+            $p->begin_page_ext($w, $h, '');
+            $p->fit_pdi_page($page, 0, 0, '');
+            // Wasserzeichen als Artifact (fuer Screenreader unsichtbar)
+            $item = $p->begin_item('Artifact', 'artifacttype=Layout');
+            $p->fit_textline($text, $w / 2, $h / 2,
+                "font=$font fontsize=28 fillcolor={gray 0.5} gstate=$gs rotate=35 position={center center}");
+            $p->end_item($item);
+            $p->end_page_ext('');
+            $p->close_pdi_page($page);
+        }
+        $p->end_document('');
+        $p->close_pdi_document($doc);
     }
 
     /**
@@ -323,10 +393,11 @@ class PdfBenchmarkController extends Controller
             $lines = $json ? array_values(array_filter(array_map('trim', explode("\n", $json)), 'strlen')) : [];
             $r = $lines ? json_decode(end($lines), true) : null;   // letzte nicht-leere Zeile = JSON
             if (!is_array($r) || empty($r['ok'])) { @unlink($o); return ['ok' => false, 'note' => $r['note'] ?? 'Worker ohne gueltige Ausgabe']; }
-            if ($i > 0) { $times[] = $r['ms']; $peak = max($peak, $r['peak_mb']); }
+            if ($i > 0) { $times[] = $r['ms']; $peak = max($peak, $r['peak_mb']); $size = $r['size'] ?? 0; }
             if ($i < $repeats) @unlink($o); else $out = $o;        // letzten Output behalten (Validierung)
         }
-        return ['ok' => true, 'median' => round($this->median($times), 1), 'min' => round(min($times), 1), 'peak_mb' => $peak, 'out' => $out];
+        return ['ok' => true, 'median' => round($this->median($times), 1), 'min' => round(min($times), 1),
+            'peak_mb' => $peak, 'size' => $size ?? 0, 'out' => $out];
     }
 
     private function rootHasStructTree(string $pdf): ?bool
@@ -364,7 +435,19 @@ class PdfBenchmarkController extends Controller
     {
         $bar = str_repeat('═', 72);
         $sep = str_repeat('─', 72);
-        $ms  = fn($r) => empty($r['ok']) ? '       n/a' : sprintf('%10s ms', number_format($r['median'], 0));
+        $ms  = function ($r) {
+            if (empty($r['ok'])) return '       n/a';
+            $s = sprintf('%10s ms', number_format($r['median'], 0));
+            if (!empty($r['size'])) $s .= sprintf('   (%.2f MB)', $r['size'] / 1048576);
+            return $s;
+        };
+        $structLabel = fn(string $v) => match($v) {
+            'ja'   => 'ja – Tags bleiben erhalten',
+            'NEIN' => 'NEIN – Tags gehen verloren!',
+            '–'    => '– (PDF nicht getaggt)',
+            default => $v,
+        };
+        $pdflibMissing = false;
 
         foreach ($rows as $r) {
             $a = $r['a'];
@@ -373,10 +456,11 @@ class PdfBenchmarkController extends Controller
             $this->stdout(sprintf("  %.2f MB  ·  %d Seiten  ·  getaggt: %s\n",
                 $a['size'] / 1048576, $a['pages'], $a['tagged'] ? 'ja' : 'nein'));
             $this->stdout("$sep\n");
-            $this->stdout(sprintf("  %-30s  %s\n", 'A  SetaPDF heute',         $ms($r['A'])));
-            $this->stdout(sprintf("  %-30s  %s\n", 'B  SetaPDF + gc_disable()', $ms($r['B'])));
-            $this->stdout(sprintf("  %-30s  %s\n", 'D  SetaPDF opt. Quelle',   $ms($r['D'])));
-            $this->stdout(sprintf("  %-30s  %s\n", 'C  qpdf-Overlay',          $ms($r['C'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'A  SetaPDF heute',          $ms($r['A'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'B  SetaPDF + gc_disable()', $ms($r['B'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'D  SetaPDF opt. Quelle',    $ms($r['D'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'C  qpdf-Overlay',           $ms($r['C'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'E  PDFlib+PDI-Overlay',     $ms($r['E'])));
             $this->stdout("$sep\n");
 
             // Einmalige Quelloptimierung
@@ -385,16 +469,16 @@ class PdfBenchmarkController extends Controller
                     $a['size'] / 1048576, $r['O']['size'] / 1048576));
             }
 
-            // Tags und PDF/UA
-            $structLabel = match($r['structOK']) {
-                'ja'   => 'ja – Barrierefreiheits-Tags bleiben erhalten',
-                'NEIN' => 'NEIN – Tags gehen verloren!',
-                '–'    => '– (PDF nicht getaggt)',
-                default => $r['structOK'],
-            };
-            $this->stdout(sprintf("  Tags erhalten (qpdf-Weg):              %s\n", $structLabel));
-            $uaLabel = $r['ua'] ?? ($verapdf ? '?' : 'nicht geprüft  (--verapdf angeben)');
-            $this->stdout(sprintf("  PDF/UA-Konformität (qpdf-Ergebnis):    %s\n", $uaLabel));
+            // Tags und PDF/UA je Kandidat
+            $this->stdout(sprintf("  Tags erhalten   C qpdf:    %s\n", $structLabel($r['structOK'])));
+            if (!empty($r['E']['ok'])) {
+                $this->stdout(sprintf("                  E PDFlib:  %s\n", $structLabel($r['structOKE'])));
+            }
+            $uaMiss = $verapdf ? '?' : 'nicht geprüft  (--verapdf angeben)';
+            $this->stdout(sprintf("  PDF/UA          C qpdf:    %s\n", $r['ua'] ?? $uaMiss));
+            if (!empty($r['E']['ok'])) {
+                $this->stdout(sprintf("                  E PDFlib:  %s\n", $r['uaE'] ?? $uaMiss));
+            }
 
             // Automatische Interpretation
             $this->stdout("$sep\n");
@@ -403,7 +487,7 @@ class PdfBenchmarkController extends Controller
             if (!empty($r['A']['ok']) && !empty($r['B']['ok'])) {
                 $gcPct = ($r['B']['median'] - $r['A']['median']) / $r['A']['median'] * 100;
                 if (abs($gcPct) < 5)
-                    $this->stdout("  · gc_disable() bringt keinen messbaren Vorteil.\n");
+                    $this->stdout("  · gc_disable() bringt nichts – der GC ist bei diesem PDF nicht der Engpass.\n");
                 elseif ($gcPct < 0)
                     $this->stdout(sprintf("  · gc_disable() spart %.0f%% – billigster Gewinn ohne Tool-Wechsel.\n", -$gcPct));
                 else
@@ -420,15 +504,26 @@ class PdfBenchmarkController extends Controller
                     $this->stdout("  · Quelloptimierung hat keinen wesentlichen Einfluss auf SetaPDF.\n");
             }
 
-            if (!empty($r['A']['ok']) && !empty($r['C']['ok'])) {
-                $factor  = $r['A']['median'] / $r['C']['median'];
-                $savePct = ($r['A']['median'] - $r['C']['median']) / $r['A']['median'] * 100;
-                $this->stdout(sprintf("  · qpdf-Overlay ist %.1f× schneller als SetaPDF heute (%.0f%% weniger Zeit).\n",
-                    $factor, $savePct));
-                if ($r['structOK'] === 'ja')
-                    $this->stdout("  · Tags bleiben erhalten – qpdf ist für barrierefreie PDFs einsetzbar.\n");
-                elseif ($r['structOK'] === 'NEIN')
-                    $this->stdout("  · Tags gehen verloren – qpdf ohne Nachbesserung NICHT einsetzbar!\n");
+            // schnellsten einsetzbaren Kandidaten benennen
+            foreach ([['C', 'qpdf-Overlay', $r['structOK']], ['E', 'PDFlib+PDI', $r['structOKE'] ?? '?']] as [$k, $label, $struct]) {
+                if (empty($r['A']['ok']) || empty($r[$k]['ok'])) continue;
+                $factor  = $r['A']['median'] / $r[$k]['median'];
+                $savePct = ($r['A']['median'] - $r[$k]['median']) / $r['A']['median'] * 100;
+                $this->stdout(sprintf("  · %s ist %.1f× schneller als SetaPDF heute (%.0f%% weniger Zeit).\n",
+                    $label, $factor, $savePct));
+                if ($struct === 'NEIN')
+                    $this->stdout("    ABER: Tags gehen verloren – ohne Nachbesserung NICHT einsetzbar!\n");
+            }
+            if (!empty($r['C']['ok']) && !empty($r['E']['ok'])) {
+                $faster = $r['C']['median'] <= $r['E']['median'] ? 'qpdf' : 'PDFlib';
+                $ratio  = max($r['C']['median'], $r['E']['median']) / max(1, min($r['C']['median'], $r['E']['median']));
+                $this->stdout(sprintf("  · Direktvergleich der Kandidaten: %s ist %.1f× schneller.\n", $faster, $ratio));
+            }
+
+            if (empty($r['E']['ok']) && str_contains($r['E']['note'] ?? '', 'PDFlib-Erweiterung')) {
+                $pdflibMissing = true;
+            } elseif (empty($r['E']['ok']) && !empty($r['E']['note'])) {
+                $this->stdout("  · PDFlib-Variante fehlgeschlagen: {$r['E']['note']}\n");
             }
 
             if (empty($r['A']['ok']) && $firstErr) {
@@ -438,16 +533,23 @@ class PdfBenchmarkController extends Controller
             }
         }
 
+        if ($pdflibMissing) {
+            $this->stdout("\n  ℹ PDFlib-Variante (E) übersprungen: PHP-Erweiterung 'PDFlib' ist nicht geladen.\n");
+            $this->stdout("    Zum Testen: PDFlib+PDI-Paket von pdflib.com installieren (php.ini: extension=pdflib),\n");
+            $this->stdout("    Evaluierungsversion läuft mit Demo-Stempel – für Zeitmessung ausreichend.\n");
+        }
+
         // Gesamt-Median (nur bei mehr als einer PDF sinnvoll)
-        $agg = ['A' => [], 'B' => [], 'C' => [], 'D' => []];
-        foreach ($rows as $r) foreach (['A', 'B', 'C', 'D'] as $k) if (!empty($r[$k]['ok'])) $agg[$k][] = $r[$k]['median'];
+        $agg = ['A' => [], 'B' => [], 'C' => [], 'D' => [], 'E' => []];
+        foreach ($rows as $r) foreach (array_keys($agg) as $k) if (!empty($r[$k]['ok'])) $agg[$k][] = $r[$k]['median'];
         if (count($rows) > 1 && array_filter($agg)) {
             $med = fn($k) => $agg[$k] ? number_format($this->median($agg[$k]), 0) . ' ms' : 'n/a';
             $this->stdout("\n$bar\n  GESAMT-MEDIAN über alle PDFs\n$sep\n");
-            $this->stdout(sprintf("  %-30s  %10s\n", 'A  SetaPDF heute',         $med('A')));
-            $this->stdout(sprintf("  %-30s  %10s\n", 'B  SetaPDF + gc_disable()', $med('B')));
-            $this->stdout(sprintf("  %-30s  %10s\n", 'D  SetaPDF opt. Quelle',   $med('D')));
-            $this->stdout(sprintf("  %-30s  %10s\n", 'C  qpdf-Overlay',          $med('C')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'A  SetaPDF heute',          $med('A')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'B  SetaPDF + gc_disable()', $med('B')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'D  SetaPDF opt. Quelle',    $med('D')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'C  qpdf-Overlay',           $med('C')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'E  PDFlib+PDI-Overlay',     $med('E')));
             $this->stdout("$bar\n");
         }
     }
