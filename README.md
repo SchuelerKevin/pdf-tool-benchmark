@@ -45,29 +45,23 @@ und stempelt ein Demo-Wasserzeichen ins Ergebnis – für die Zeitmessung völli
 ausreichend. Ohne Extension wird E automatisch übersprungen (mit Hinweis am
 Ende des Reports).
 
-Installation (PHP 8.2 NTS, Linux x86_64):
+Installation (PHP 8.2 NTS, Linux x64):
 
 ```bash
-# 1. Paket herunterladen:
-#    https://www.pdflib.com/download/pdflib-product-family/
-#    → "PDFlib 11" → "PHP" → "Linux (x86_64)"
-#    Dateiname ungefähr: PDFlib-11.x.x-Linux-x86_64-php82.tar.gz
+# 1. Paket herunterladen (PDFlib 11.0.0, Linux x64, PHP):
+wget https://www.pdflib.com/binaries/PDFlib/1100/PDFlib-11.0.0-Linux-x64-php.tar.gz
 
 # 2. Entpacken
-tar xzf PDFlib-11.*-Linux-x86_64-php82.tar.gz
-cd PDFlib-11.*-Linux-x86_64-php82/
+tar xzf PDFlib-11.0.0-Linux-x64-php.tar.gz
+cd PDFlib-11.0.0-Linux-x64-php/
 
-# 3. Welche .so-Dateien sind im Paket?
-find . -name "*.so"
-# Gesuchte Datei: php-8.2/php_pdflib.so (o.ä.)
+# 3. .so für PHP 8.2 ins Extension-Verzeichnis kopieren
+cp bind/php/php-8.2/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
 
-# 4. .so ins PHP-Extension-Verzeichnis kopieren
-cp php-8.2/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
-
-# 5. In php.ini eintragen (Pfad ermitteln: php --ini)
+# 4. In php.ini eintragen (Pfad ermitteln: php --ini)
 echo "extension=php_pdflib.so" >> /pfad/zur/php.ini
 
-# 6. Prüfen
+# 5. Prüfen
 php -r "echo class_exists('PDFlib') ? 'PDFlib geladen' : 'FEHLER';"
 ```
 
