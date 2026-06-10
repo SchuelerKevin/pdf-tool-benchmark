@@ -112,7 +112,7 @@ php yii_dev pdf-benchmark/run /var/www/console/runtime/benchpdfs \
 | `--licensor="…"` / `--stampCopyright=1` | Copyright-Zeile wie in Produktion |
 | `--optimizeImages=0` | Bild-Recompression bei der Quelloptimierung aus |
 | `--recursive=1` | Unterordner einbeziehen |
-| `--keep=1` | Gestampte Ergebnisse behalten, um sie optisch zu vergleichen. Pro PDF und Variante wird nur das letzte Exemplar aufgehoben (Zwischenmessungen werden sofort gelöscht), also maximal `PDFs × Varianten` Dateien. Pfad zum Verzeichnis steht am Ende des Reports. Dateien per `docker cp <container>:/tmp/stampbench_.../ ~/Downloads/` auf den lokalen Rechner kopieren. |
+| `--keep=1` | Gestampte Ergebnisse behalten, um sie zu vergleichen. Pro PDF und Variante wird nur das letzte Exemplar aufgehoben (Zwischenmessungen werden sofort gelöscht), also maximal `PDFs × Varianten` Dateien. Pfad zum Verzeichnis steht am Ende des Reports. Dateien per `docker cp <container>:/tmp/stampbench_.../ ~/Downloads/` auf den lokalen Rechner kopieren. |
 
 ## 5. Report lesen
 
