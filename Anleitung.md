@@ -1,4 +1,4 @@
-# Stamping-Benchmark – Anleitung (v2)
+# Stamping-Benchmark – Anleitung
 
 Vergleicht fünf Varianten über einen Ordner voller PDFs:
 
