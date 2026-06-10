@@ -1,4 +1,4 @@
-# Stamping-Benchmark – Anleitung
+# Stamping-Benchmark – Anleitung (v2)
 
 Vergleicht fünf Varianten über einen Ordner voller PDFs:
 
@@ -40,11 +40,36 @@ unzip verapdf-installer.zip && cd verapdf-greenfield-*
 
 Danach mit `--verapdf=/opt/verapdf/verapdf` aufrufen.
 
-**Optional: PDFlib** – für Variante E. PDFlib+PDI-Paket (PHP-Extension) von
-pdflib.com installieren und in der php.ini laden (`extension=pdflib`). Die
-**Evaluierungsversion ist kostenlos** und stempelt ein Demo-Wasserzeichen ins
-Ergebnis – für die Zeitmessung völlig ausreichend. Ohne Extension wird E
-automatisch übersprungen (mit Hinweis am Ende des Reports).
+**Optional: PDFlib** – für Variante E. Die Evaluierungsversion ist kostenlos
+und stempelt ein Demo-Wasserzeichen ins Ergebnis – für die Zeitmessung völlig
+ausreichend. Ohne Extension wird E automatisch übersprungen (mit Hinweis am
+Ende des Reports).
+
+Installation (PHP 8.2 NTS, Linux x86_64):
+
+```bash
+# 1. Paket herunterladen:
+#    https://www.pdflib.com/download/pdflib-product-family/
+#    → "PDFlib 11" → "PHP" → "Linux (x86_64)"
+#    Dateiname ungefähr: PDFlib-11.x.x-Linux-x86_64-php82.tar.gz
+
+# 2. Entpacken
+tar xzf PDFlib-11.*-Linux-x86_64-php82.tar.gz
+cd PDFlib-11.*-Linux-x86_64-php82/
+
+# 3. Welche .so-Dateien sind im Paket?
+find . -name "*.so"
+# Gesuchte Datei: php-8.2/php_pdflib.so (o.ä.)
+
+# 4. .so ins PHP-Extension-Verzeichnis kopieren
+cp php-8.2/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
+
+# 5. In php.ini eintragen (Pfad ermitteln: php --ini)
+echo "extension=php_pdflib.so" >> /pfad/zur/php.ini
+
+# 6. Prüfen
+php -r "echo class_exists('PDFlib') ? 'PDFlib geladen' : 'FEHLER';"
+```
 
 ## 2. Controller einsetzen
 
@@ -111,9 +136,6 @@ Entscheidungslogik:
 
 ## 6. Bekannte Stolpersteine
 
-- **„VERSCHLUESSELT, übersprungen"** bei Quelldateien: Das sind PDFs, die schon
-  durch eure Stamping-Pipeline gelaufen sind (setSecurity). Ungestampte
-  Originale vom S3 verwenden.
 - **SetaPDF-Spalten n/a:** Fehlermeldung steht unter dem Block. Meist
   PDF_BEHAVIOR-Klassenname oder (bei `--security=1`) Pdfsec/DB nicht erreichbar.
 - **PDFlib-Variante fehlgeschlagen:** Die E-Implementierung ist eine
