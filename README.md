@@ -56,7 +56,7 @@ tar xzf PDFlib-11.0.0-Linux-x64-php.tar.gz
 cd PDFlib-11.0.0-Linux-x64-php/
 
 # 3. .so für PHP 8.2 ins Extension-Verzeichnis kopieren
-cp bind/php/php-8.2/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
+cp bind/php/php-820-nts/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
 
 # 4. In php.ini eintragen (Pfad ermitteln: php --ini)
 echo "extension=php_pdflib.so" >> /pfad/zur/php.ini
