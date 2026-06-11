@@ -58,8 +58,9 @@ cd PDFlib-11.0.0-Linux-x64-php/
 # 3. .so für PHP 8.2 ins Extension-Verzeichnis kopieren
 cp bind/php/php-820-nts/php_pdflib.so $(php -r "echo ini_get('extension_dir');")
 
-# 4. In php.ini eintragen (Pfad ermitteln: php --ini)
-echo "extension=php_pdflib.so" >> /pfad/zur/php.ini
+# 4. Als eigene ini-Datei im conf.d-Verzeichnis eintragen (Docker-typisch,
+#    analog zu den anderen Extensions wie docker-php-ext-mongodb.ini):
+echo "extension=php_pdflib.so" > /usr/local/etc/php/conf.d/docker-php-ext-pdflib.ini
 
 # 5. Prüfen
 php -r "echo class_exists('PDFlib') ? 'PDFlib geladen' : 'FEHLER';"
