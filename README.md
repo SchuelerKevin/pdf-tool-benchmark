@@ -35,10 +35,14 @@ java -version || apt-get install -y default-jre-headless
 # veraPDF-Installer laden und headless installieren
 wget https://software.verapdf.org/releases/verapdf-installer.zip
 unzip verapdf-installer.zip && cd verapdf-greenfield-*
-./verapdf-install   # interaktiv; Zielpfad z. B. /opt/verapdf
+./verapdf-install   # interaktiv; als Installationspfad /opt/verapdf eingeben
 ```
 
-Danach mit `--verapdf=/opt/verapdf/verapdf` aufrufen.
+Der Installer fragt nach dem Installationspfad – dort `/opt/verapdf` eingeben,
+dann passt der Aufruf `--verapdf=/opt/verapdf/verapdf` aus dieser Anleitung.
+Wird der Default übernommen, landet veraPDF stattdessen unter `~/verapdf`
+(im Container als root: `/root/verapdf`) und der Aufruf lautet
+`--verapdf=/root/verapdf/verapdf`.
 
 **Optional: PDFlib** – für Variante E. Die Evaluierungsversion ist kostenlos
 und stempelt ein Demo-Wasserzeichen ins Ergebnis – für die Zeitmessung völlig
@@ -72,16 +76,29 @@ php -r "echo class_exists('PDFlib') ? 'PDFlib geladen' : 'FEHLER';"
 (separates Git-Repo, in `console/.gitignore` eingetragen).
 
 Der Namespace oben in der Datei muss `console\controllers` sein (nicht der
-Unterordnerpfad) — Yii findet die Klasse über den `controllerMap`-Eintrag in
-`common/config/applications/console/main-dev.php`:
+Unterordnerpfad). Weil die Datei nicht dort liegt, wo der Composer-Autoloader
+sie nach PSR-4 erwarten würde, braucht es zwei Einträge in
+`common/config/applications/console/main-dev.php`: ein manuelles Class-Mapping
+(damit PHP die Datei findet) und den `controllerMap`-Eintrag (damit Yii den
+Befehl `pdf-benchmark` kennt):
 
 ```php
+<?php
+
+// Datei liegt im Unterordner pdf-tool-benchmark/, daher manuelles Class-Mapping
+Yii::$classMap['console\controllers\PdfBenchmarkController'] =
+    dirname(__DIR__, 4) . '/console/controllers/pdf-tool-benchmark/PdfBenchmarkController.php';
+
 return [
     'controllerMap' => [
         'pdf-benchmark' => \console\controllers\PdfBenchmarkController::class,
     ],
 ];
 ```
+
+`dirname(__DIR__, 4)` geht von `common/config/applications/console/` zum
+Projekt-Root. Falls die Verzeichnisstruktur abweicht, stattdessen den absoluten
+Pfad zur Controller-Datei eintragen.
 
 Der `PDF_BEHAVIOR`-Klassenname oben in der Datei ist bereits auf
 `\common\components\PdfBehavior` gesetzt.
@@ -108,7 +125,7 @@ php yii_dev pdf-benchmark/run /var/www/console/runtime/benchpdfs \
 |--------|-----------|
 | `--repeats=5` | mehr Wiederholungen → stabilerer Median |
 | `--text="…"` | Wasserzeichen-Text |
-| `--security=1` | **Produktionsgetreu messen:** SetaPDF verschlüsselt via `setSecurity` + euer Pdfsec (wird aus der DB geladen wie in `sendPdf()`); qpdf verschlüsselt zum fairen Vergleich ebenfalls (AES-256, Drucken ja / Kopieren+Ändern nein). Ohne diese Option misst der Benchmark *weniger* Arbeit als die Produktion. |
+| `--security=1` | Verschlüsselung mitmessen: SetaPDF hängt einen generischen AES-256-SecHandler an (nicht den `setSecurity`-Pfad des PdfBehaviors, der kundenspezifische Einstellungen bräuchte), qpdf verschlüsselt identisch (AES-256, Drucken ja / Kopieren+Ändern nein). Ohne diese Option misst der Benchmark *weniger* Arbeit als die Produktion. |
 | `--verapdf=…` | PDF/UA-Prüfung der gestampten Ergebnisse (C und E) |
 | `--licensor="…"` / `--stampCopyright=1` | Copyright-Zeile wie in Produktion |
 | `--optimizeImages=0` | Bild-Recompression bei der Quelloptimierung aus |
@@ -132,7 +149,7 @@ Entscheidungslogik:
 ## 6. Bekannte Stolpersteine
 
 - **SetaPDF-Spalten n/a:** Fehlermeldung steht unter dem Block. Meist
-  PDF_BEHAVIOR-Klassenname oder (bei `--security=1`) Pdfsec/DB nicht erreichbar.
+  PDF_BEHAVIOR-Klassenname falsch; die Fehlermeldung steht direkt darunter.
 - **PDFlib-Variante fehlgeschlagen:** Die E-Implementierung ist eine
   Referenz nach PDFlib-Doku und konnte ohne Lizenz nicht vorab getestet
   werden – API-Abweichungen je nach PDFlib-Version erscheinen als Fehlertext

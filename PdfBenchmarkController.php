@@ -75,6 +75,9 @@ class PdfBenchmarkController extends Controller
             }
         }
         $verapdf = ($this->verapdf && is_file($this->verapdf)) ? $this->verapdf : null;
+        if ($this->verapdf && !$verapdf) {
+            $this->stderr("WARNUNG: --verapdf={$this->verapdf} ist keine Datei – PDF/UA-Prüfung wird übersprungen.\n");
+        }
         $repeats = max(1, (int)$this->repeats);
 
         // Pfade fuer den Worker-Subprozess (gleiches yii-Entry-Skript)
@@ -107,8 +110,9 @@ class PdfBenchmarkController extends Controller
             $B = $this->bench($php, $yii, 'setapdf_rewrite_gc', $pdf, $base, $repeats);
             $C = $O['ok'] ? $this->bench($php, $yii, 'qpdf_overlay',    $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
             $D = $O['ok'] ? $this->bench($php, $yii, 'setapdf_rewrite', $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
-            // E: PDFlib+PDI (nur falls die Erweiterung geladen ist; sonst sauber n/a)
-            $E = $O['ok'] ? $this->bench($php, $yii, 'pdflib_overlay',  $opt, $base, $repeats) : ['ok' => false, 'note' => 'keine opt. Quelle'];
+            // E: PDFlib+PDI auf dem ORIGINAL (fairer Vergleich zu A; PDFlib
+            // schreibt ohnehin alles neu und braucht keine Voroptimierung)
+            $E = $this->bench($php, $yii, 'pdflib_overlay', $pdf, $base, $repeats);
 
             foreach ([$A, $B, $C, $D] as $r) { if (empty($r['ok']) && !$firstErr && !empty($r['note'])) $firstErr = $r['note']; }
 
@@ -120,10 +124,12 @@ class PdfBenchmarkController extends Controller
             };
             $structOK  = $structCheck($C);
             $structOKE = $structCheck($E);
-            $ua  = ($verapdf && !empty($C['ok'])) ? $this->veraUA($verapdf, $C['out']) : null;
-            $uaE = ($verapdf && !empty($E['ok'])) ? $this->veraUA($verapdf, $E['out']) : null;
+            $this->stderr("        Prüfe Tags und PDF/UA ...\n");
+            $ua    = ($verapdf && !empty($C['ok'])) ? $this->veraUA($verapdf, $C['out']) : null;
+            $uaE   = ($verapdf && !empty($E['ok'])) ? $this->veraUA($verapdf, $E['out']) : null;
+            $uaSrc = $verapdf ? $this->veraUA($verapdf, $pdf) : null;   // Baseline: ist die QUELLE ueberhaupt konform?
 
-            $rows[] = compact('name', 'a', 'O', 'A', 'B', 'C', 'D', 'E', 'structOK', 'structOKE', 'ua', 'uaE');
+            $rows[] = compact('name', 'a', 'O', 'A', 'B', 'C', 'D', 'E', 'structOK', 'structOKE', 'ua', 'uaE', 'uaSrc');
         }
 
         $this->printReport($rows, $firstErr, $bootstrapOk = true, $verapdf);
@@ -189,17 +195,6 @@ class PdfBenchmarkController extends Controller
     {
         $raw = file_get_contents($in);
 
-        // Bei --security=1 das echte Pdfsec laden – exakt wie in sendPdf().
-        $pdfsec = null;
-        if ($this->security) {
-            $pdfsec = \common\models\Pdfsec::find()
-                ->where(['=', 'pid', Yii::$app->params['pid']])
-                ->one();
-            if ($pdfsec === null) {
-                throw new \RuntimeException('Pdfsec fuer pid "' . (Yii::$app->params['pid'] ?? '?') . '" nicht gefunden (DB erreichbar? params korrekt?)');
-            }
-        }
-
         $this->attachBehavior('pdf', [
             'class'          => self::PDF_BEHAVIOR,
             'rawPdf'         => $raw,
@@ -207,14 +202,31 @@ class PdfBenchmarkController extends Controller
             'copyrightText'  => $this->licensor,
             'stampCopyright' => (bool)$this->stampCopyright,
             'stampFirst'     => false,
-            'setSecurity'    => (bool)$this->security,
-            'rights'         => $pdfsec,
+            // setSecurity des Behaviors braucht intern das Pdfsec-Modell ('rights').
+            // Der Benchmark soll ohne kundenspezifische Konfiguration laufen, daher
+            // bleibt das hier aus; die Verschluesselung wird bei --security=1 unten
+            // generisch direkt ueber den SetaPDF-SecHandler angehaengt.
+            'setSecurity'    => false,
+            'rights'         => null,
         ]);
 
         if ($disableGc) gc_disable();       // Tipp von SetaPDF: PHP-GC vor dem Lauf aus
         try {
             $this->behaviors['pdf']->init();
             $this->stamp();                                   // vom Behavior bereitgestellt
+            if ($this->security) {
+                // Generische AES-256-Verschluesselung, gleiche Rechte wie die
+                // qpdf-Variante (Drucken ja, Kopieren/Aendern nein). API laut
+                // SetaPDF-Core-Doku; weicht eure Version ab, erscheint der
+                // Fehler als note im Report.
+                $secHandler = \SetaPDF_Core_SecHandler_Standard_Aes256::factory(
+                    $this->pdf,
+                    '',                              // kein Oeffnungs-Passwort
+                    bin2hex(random_bytes(16)),       // Owner-Passwort
+                    \SetaPDF_Core_SecHandler::PERM_PRINT
+                );
+                $this->pdf->setSecHandler($secHandler);
+            }
             $writer = new \SetaPDF_Core_Writer_File($out);
             $this->pdf->setWriter($writer);
             $this->pdf->save(\SetaPDF_Core_Document::SAVE_METHOD_REWRITE_ALL)->finish();
@@ -259,35 +271,57 @@ class PdfBenchmarkController extends Controller
         if (!class_exists('\PDFlib')) {
             throw new \RuntimeException('PDFlib-Erweiterung nicht geladen – Variante uebersprungen');
         }
-        $p = new \PDFlib();
-        $p->set_option('errorpolicy=exception stringformat=utf8');
-        // Falls Lizenzschluessel noetig: $p->set_option('license=...');
+        $stage = 'init';
+        try {
+            $p = new \PDFlib();
+            $p->set_option('errorpolicy=exception stringformat=utf8');
+            // Falls Lizenzschluessel noetig: $p->set_option('license=...');
 
-        // Quelle MIT Tag-Strukturen oeffnen, Ziel im Tagged-Modus erzeugen
-        $doc = $p->open_pdi_document($in, 'usetags=true');
-        if ($p->begin_document($out, 'tagged=true lang=de') === 0) {
-            throw new \RuntimeException('PDFlib begin_document: ' . $p->get_errmsg());
-        }
-        $gs   = $p->create_gstate('opacityfill=0.3 opacitystroke=0.3');
-        $font = $p->load_font('Helvetica', 'unicode', 'embedding');
-        $n    = (int)$p->pcos_get_number($doc, 'length:pages');
+            // Quelle MIT Tag-Strukturen oeffnen, Ziel im Tagged-Modus erzeugen
+            $stage = 'open_pdi_document';
+            $doc = $p->open_pdi_document($in, 'usetags=true');
+            $stage = 'begin_document';
+            if ($p->begin_document($out, 'tagged=true lang=de') === 0) {
+                throw new \RuntimeException('begin_document: ' . $p->get_errmsg());
+            }
+            $stage = 'setup';
+            $gs   = $p->create_gstate('opacityfill=0.3 opacitystroke=0.3');
+            // Core-Font ohne Einbettung (wie beim qpdf-Stamp; fuer die Zeitmessung
+            // ausreichend, fuer PDF/UA muesste eine echte Fontdatei eingebettet werden)
+            $font = $p->load_font('Helvetica', 'unicode', '');
+            $n    = (int)$p->pcos_get_number($doc, 'length:pages');
 
-        for ($i = 0; $i < $n; $i++) {
-            $w = $p->pcos_get_number($doc, "pages[$i]/width");
-            $h = $p->pcos_get_number($doc, "pages[$i]/height");
-            $page = $p->open_pdi_page($doc, $i + 1, 'usetags=true');
-            $p->begin_page_ext($w, $h, '');
-            $p->fit_pdi_page($page, 0, 0, '');
-            // Wasserzeichen als Artifact (fuer Screenreader unsichtbar)
-            $item = $p->begin_item('Artifact', 'artifacttype=Layout');
-            $p->fit_textline($text, $w / 2, $h / 2,
-                "font=$font fontsize=28 fillcolor={gray 0.5} gstate=$gs rotate=35 position={center center}");
-            $p->end_item($item);
-            $p->end_page_ext('');
-            $p->close_pdi_page($page);
+            // Tagged-Ausgabe verlangt ein vom Client erzeugtes Wurzelelement;
+            // die importierte Struktur der Seiten wird darunter eingehaengt.
+            $stage = 'begin_item Document';
+            $rootItem = $p->begin_item('Document', '');
+
+            for ($i = 0; $i < $n; $i++) {
+                $w = $p->pcos_get_number($doc, "pages[$i]/width");
+                $h = $p->pcos_get_number($doc, "pages[$i]/height");
+                $stage = 'open_pdi_page #' . ($i + 1);
+                $page = $p->open_pdi_page($doc, $i + 1, '');
+                $p->begin_page_ext($w, $h, '');
+                $stage = 'fit_pdi_page #' . ($i + 1);
+                $p->fit_pdi_page($page, 0, 0, '');
+                // Wasserzeichen als Artifact (fuer Screenreader unsichtbar)
+                $stage = 'artifact #' . ($i + 1);
+                $item = $p->begin_item('Artifact', 'artifacttype=Layout');
+                $p->fit_textline($text, $w / 2, $h / 2,
+                    "font=$font fontsize=28 fillcolor={gray 0.5} gstate=$gs rotate=35 position={center center}");
+                $p->end_item($item);
+                $p->end_page_ext('');
+                $p->close_pdi_page($page);
+            }
+            $stage = 'end_item Document';
+            $p->end_item($rootItem);
+            $stage = 'end_document';
+            $p->end_document('');
+            $p->close_pdi_document($doc);
+        } catch (\Throwable $e) {
+            // Stage anhaengen, damit der Report zeigt, WELCHER Aufruf scheitert
+            throw new \RuntimeException("[$stage] " . $e->getMessage(), 0, $e);
         }
-        $p->end_document('');
-        $p->close_pdi_document($doc);
     }
 
     /**
@@ -370,17 +404,33 @@ class PdfBenchmarkController extends Controller
 
     private function optimizeSource(string $in, string $out, bool $optImages): array
     {
+        $this->stderr("        Optimiere Quelle ...\n");
         $flags = '--object-streams=generate --compress-streams=y --recompress-flate --linearize';
         if ($optImages) $flags .= ' --optimize-images';
         $t0 = hrtime(true);
         exec('qpdf ' . escapeshellarg($in) . " $flags " . escapeshellarg($out) . ' 2>&1', $o, $rc);
         if (($rc !== 0 && $rc !== 3) || !is_file($out)) return ['ok' => false, 'note' => "qpdf rc=$rc"];
-        return ['ok' => true, 'ms' => round((hrtime(true) - $t0) / 1e6, 1), 'size' => filesize($out)];
+        $ms = round((hrtime(true) - $t0) / 1e6, 1);
+        $this->stderr(sprintf("        → %.2f MB  (%s ms)\n", filesize($out) / 1048576, number_format($ms, 0)));
+        return ['ok' => true, 'ms' => $ms, 'size' => filesize($out)];
     }
 
     /** 1 Warmup + N Messungen, jeder Lauf in frischem Prozess. */
     private function bench(string $php, string $yii, string $op, string $in, string $base, int $repeats): array
     {
+        $labels = [
+            'setapdf_rewrite'    => 'A  SetaPDF heute',
+            'setapdf_rewrite_gc' => 'B  SetaPDF + gc_disable()',
+            'qpdf_overlay'       => 'C  qpdf-Overlay',
+            'setapdf_rewrite_d'  => 'D  SetaPDF opt. Quelle',
+            'pdflib_overlay'     => 'E  PDFlib+PDI',
+        ];
+        // D wird mit derselben Op wie A gemessen, aber auf der optimierten Quelle;
+        // Label aus dem Dateinamen-Suffix ableiten ist nicht moeglich, daher Heuristik:
+        $label = $labels[$op] ?? $op;
+        if ($op === 'setapdf_rewrite' && str_contains($base, '.opt')) $label = 'D  SetaPDF opt. Quelle';
+
+        $this->stderr(sprintf("        %-28s  Warmup ...", $label));
         $times = []; $peak = 0; $out = null;
         for ($i = 0; $i <= $repeats; $i++) {                 // i=0 = Warmup
             $o = "$base.$op.$i.pdf";
@@ -392,11 +442,22 @@ class PdfBenchmarkController extends Controller
             $json = shell_exec($cmd . ' 2>/dev/null');
             $lines = $json ? array_values(array_filter(array_map('trim', explode("\n", $json)), 'strlen')) : [];
             $r = $lines ? json_decode(end($lines), true) : null;   // letzte nicht-leere Zeile = JSON
-            if (!is_array($r) || empty($r['ok'])) { @unlink($o); return ['ok' => false, 'note' => $r['note'] ?? 'Worker ohne gueltige Ausgabe']; }
+            if (!is_array($r) || empty($r['ok'])) {
+                $this->stderr(sprintf("  FEHLER: %s\n", $r['note'] ?? 'Worker ohne gueltige Ausgabe'));
+                @unlink($o);
+                return ['ok' => false, 'note' => $r['note'] ?? 'Worker ohne gueltige Ausgabe'];
+            }
+            if ($i === 0) {
+                $this->stderr(sprintf("  Lauf 1/%d ...", $repeats));
+            } elseif ($i < $repeats) {
+                $this->stderr(sprintf("  %d/%d (%s ms) ...", $i + 1, $repeats, number_format($r['ms'], 0)));
+            }
             if ($i > 0) { $times[] = $r['ms']; $peak = max($peak, $r['peak_mb']); $size = $r['size'] ?? 0; }
             if ($i < $repeats) @unlink($o); else $out = $o;        // letzten Output behalten (Validierung)
         }
-        return ['ok' => true, 'median' => round($this->median($times), 1), 'min' => round(min($times), 1),
+        $median = round($this->median($times), 1);
+        $this->stderr(sprintf("  → Median %s ms\n", number_format($median, 0)));
+        return ['ok' => true, 'median' => $median, 'min' => round(min($times), 1),
             'peak_mb' => $peak, 'size' => $size ?? 0, 'out' => $out];
     }
 
@@ -412,8 +473,16 @@ class PdfBenchmarkController extends Controller
     {
         if (!$pdf || !is_file($pdf)) return null;
         $o = shell_exec(escapeshellarg($verapdf) . ' --flavour ua1 ' . escapeshellarg($pdf) . ' 2>/dev/null') ?: '';
-        if (preg_match('/isCompliant="(true|false)"/', $o, $m)) return $m[1] === 'true' ? 'PASS' : 'FAIL';
-        return '?';
+        if (!preg_match('/isCompliant="(true|false)"/', $o, $m)) return '?';
+        if ($m[1] === 'true') return 'PASS';
+        // Bei FAIL die verletzten Klauseln (Matterhorn/ISO-Abschnitte) mitgeben,
+        // damit man Quelle und gestampftes Ergebnis vergleichen kann.
+        preg_match_all('/clause="([^"]+)"/', $o, $cm);
+        $clauses = array_values(array_unique($cm[1] ?? []));
+        sort($clauses);
+        $shown = implode(', ', array_slice($clauses, 0, 5));
+        $more  = count($clauses) > 5 ? ', +' . (count($clauses) - 5) . ' weitere' : '';
+        return $clauses ? "FAIL (Klauseln: $shown$more)" : 'FAIL';
     }
 
     private function median(array $xs): float { sort($xs); $n = count($xs); if (!$n) return 0.0; $m = intdiv($n, 2); return $n % 2 ? $xs[$m] : ($xs[$m - 1] + $xs[$m]) / 2; }
@@ -460,7 +529,7 @@ class PdfBenchmarkController extends Controller
             $this->stdout(sprintf("  %-28s  %s\n", 'B  SetaPDF + gc_disable()', $ms($r['B'])));
             $this->stdout(sprintf("  %-28s  %s\n", 'D  SetaPDF opt. Quelle',    $ms($r['D'])));
             $this->stdout(sprintf("  %-28s  %s\n", 'C  qpdf-Overlay',           $ms($r['C'])));
-            $this->stdout(sprintf("  %-28s  %s\n", 'E  PDFlib+PDI-Overlay',     $ms($r['E'])));
+            $this->stdout(sprintf("  %-28s  %s\n", 'E  PDFlib+PDI (Original)',  $ms($r['E'])));
             $this->stdout("$sep\n");
 
             // Einmalige Quelloptimierung
@@ -475,7 +544,12 @@ class PdfBenchmarkController extends Controller
                 $this->stdout(sprintf("                  E PDFlib:  %s\n", $structLabel($r['structOKE'])));
             }
             $uaMiss = $verapdf ? '?' : 'nicht geprüft  (--verapdf angeben)';
-            $this->stdout(sprintf("  PDF/UA          C qpdf:    %s\n", $r['ua'] ?? $uaMiss));
+            if (!empty($r['uaSrc'])) {
+                $this->stdout(sprintf("  PDF/UA          Quelle:    %s\n", $r['uaSrc']));
+                $this->stdout(sprintf("                  C qpdf:    %s\n", $r['ua'] ?? $uaMiss));
+            } else {
+                $this->stdout(sprintf("  PDF/UA          C qpdf:    %s\n", $r['ua'] ?? $uaMiss));
+            }
             if (!empty($r['E']['ok'])) {
                 $this->stdout(sprintf("                  E PDFlib:  %s\n", $r['uaE'] ?? $uaMiss));
             }
@@ -520,6 +594,12 @@ class PdfBenchmarkController extends Controller
                 $this->stdout(sprintf("  · Direktvergleich der Kandidaten: %s ist %.1f× schneller.\n", $faster, $ratio));
             }
 
+            if (!empty($r['uaSrc']) && str_starts_with($r['uaSrc'], 'FAIL')) {
+                $this->stdout("  · Die QUELLE ist selbst nicht PDF/UA-konform – ein FAIL beim Ergebnis ist dann\n");
+                $this->stdout("    nicht zwingend ein Stamping-Schaden. Klauseln von Quelle und Ergebnis vergleichen:\n");
+                $this->stdout("    nur NEUE Klauseln gehen auf das Stamping zurück.\n");
+            }
+
             if (empty($r['E']['ok']) && str_contains($r['E']['note'] ?? '', 'PDFlib-Erweiterung')) {
                 $pdflibMissing = true;
             } elseif (empty($r['E']['ok']) && !empty($r['E']['note'])) {
@@ -529,7 +609,6 @@ class PdfBenchmarkController extends Controller
             if (empty($r['A']['ok']) && $firstErr) {
                 $this->stdout("\n  ⚠ SetaPDF-Varianten konnten nicht gemessen werden.\n");
                 $this->stdout("    Fehlermeldung: $firstErr\n");
-                $this->stdout("    Häufigste Ursache: PDF_BEHAVIOR-Klassenname falsch (ganz oben in der Datei anpassen).\n");
             }
         }
 
@@ -549,7 +628,7 @@ class PdfBenchmarkController extends Controller
             $this->stdout(sprintf("  %-28s  %10s\n", 'B  SetaPDF + gc_disable()', $med('B')));
             $this->stdout(sprintf("  %-28s  %10s\n", 'D  SetaPDF opt. Quelle',    $med('D')));
             $this->stdout(sprintf("  %-28s  %10s\n", 'C  qpdf-Overlay',           $med('C')));
-            $this->stdout(sprintf("  %-28s  %10s\n", 'E  PDFlib+PDI-Overlay',     $med('E')));
+            $this->stdout(sprintf("  %-28s  %10s\n", 'E  PDFlib+PDI (Original)',  $med('E')));
             $this->stdout("$bar\n");
         }
     }
